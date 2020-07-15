@@ -3,6 +3,13 @@ import numpy as np
 import sys
 import pickle
 import logging
+from skimage.transform import resize
+from skimage.color import rgb2gray
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter(log_dir="tensorboard/")  # tensorboard writer
 
 logging.basicConfig(level=logging.DEBUG, filename='logs/logs.log', filemode='w', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 
@@ -16,14 +23,6 @@ print("Observation space:", env.observation_space)
 print("Action space:", env.action_space)
 logging.info(f'Observation space: {env.observation_space}')
 
-import torch.nn.functional as F
-import torch.nn as nn
-import torch
-
-from skimage.transform import resize
-from skimage.color import rgb2gray
-# preprocess function
-# resize obs to 110 x 110
 def preprocess(img):
   re_img = resize(img, (84, 84))
   out = np.array(rgb2gray(re_img)).astype(np.float32)
@@ -48,7 +47,7 @@ def skip_action(action):
     reward = 0
     obs = []
     for _ in range(skip_steps):
-      state, rew, done, info = env.step(action)
+      state, rew, done, _ = env.step(action)
       reward += rew
       obs.append(preprocess(state))
     obs = np.array(obs)[None, ...]
@@ -66,7 +65,7 @@ step_counter = -1
 behavior_model = Net().to(device=device)
 target_model = Net().to(device=device)
 model_copy = 1000  # K
-optimizer = torch.optim.RMSprop(behavior_model.parameters(), lr=1e-4, alpha=0.9, eps=1e-02)
+optimizer = torch.optim.Adam(behavior_model.parameters(), lr=1e-4)  # when using RMSprop use (alpha=0.9, eps=1e-02)
 loss = nn.MSELoss()
 
 BS = 32
@@ -77,7 +76,7 @@ warmup = 10000
 discount = 0.95
 skip_steps = 4
 
-env = gym.make('Pong-v0')
+env = gym.make("PongNoFrameskip-v4")
 
 rewards = []
 for episode in range(episodes):
@@ -120,11 +119,15 @@ for episode in range(episodes):
         states_next.append(obs_new_s)
         actions.append(action_s)
         rewards.append(reward_s)
-        dones.append(done_s)
+        dones.append(done_s < 0.1)
+      dones_tensor = torch.tensor(dones, device=device)
+      rewards_tensor = torch.tensor(rewards, device=device)
       targets = behavior_model(torch.tensor(states).squeeze().to(device=device))
-      targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach().cpu().numpy()
-      labels = np.array(rewards) + (np.array(done)>0) * discount * np.max(targets_next, axis=1)
-      losses = loss(targets.gather(1, torch.tensor(actions).unsqueeze(1).to(device=device)).squeeze(), torch.from_numpy(labels.astype(np.float32)).to(device=device))
+      targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach()
+      # labels = np.array(rewards) + (np.array(dones)>0) * discount * np.max(targets_next, axis=1)
+      labels = rewards_tensor + dones_tensor * discount * targets_next.max(dim=1)[0]
+      # losses = loss(targets.gather(1, torch.tensor(actions).unsqueeze(1).to(device=device)).squeeze(), torch.from_numpy(labels.astype(np.float32)).to(device=device))
+      losses = loss(targets.gather(1, torch.tensor(actions, device=device).unsqueeze(1)).squeeze(), labels)
 
       optimizer.zero_grad()
       losses.backward()
@@ -137,6 +140,11 @@ for episode in range(episodes):
   if episode % 500 == 0:
     torch.save(behavior_model, f'models/model_{episode}.pt')
   rewards.append(tot_reward)
+  writer.add_scalar("Reward/Episode", tot_reward, episode)
+  writer.add_scalar("Reward/Timestep", tot_reward, step_counter)
+  writer.add_scalar("Epsilon/Episode", epsilon, episode)
+  writer.add_scalar("Epsilon/Timestep", epsilon, step_counter)
 with open('rewards.pkl', 'wb') as f:
   pickle.dump(rewards, f)
 env.close()
+writer.flush()
