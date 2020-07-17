@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter(log_dir="tensorboard/")  # tensorboard writer
+writer = SummaryWriter(log_dir="tensorboard/run2/")  # tensorboard writer
 
 logging.basicConfig(level=logging.DEBUG, filename='logs/logs.log', filemode='w', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 
@@ -59,12 +59,14 @@ logging.info(f"Training on device {device}.")
 
 steps = int(5e3)
 episodes = int(1e4)
-mem_size = int(1e6)
-memory = [() for _ in range(mem_size)]
+mem_size = int(1e5)
+memory = np.empty(mem_size, dtype=object)
 step_counter = -1
 behavior_model = Net().to(device=device)
 target_model = Net().to(device=device)
-model_copy = 1000  # K
+for param in target_model.parameters():
+    param.requires_grad = False
+model_copy = 500  # K
 optimizer = torch.optim.Adam(behavior_model.parameters(), lr=1e-4)  # when using RMSprop use (alpha=0.9, eps=1e-02)
 loss = nn.MSELoss()
 
@@ -106,7 +108,7 @@ for episode in range(episodes):
     obs = obs_new
 
     if step_counter > warmup:
-      mini_batch = np.random.choice(np.array(memory)[:step_counter], BS)
+      mini_batch = np.random.choice(memory[:step_counter], BS)
       labels = []
       train_data = []
       states = []
@@ -123,7 +125,8 @@ for episode in range(episodes):
       dones_tensor = torch.tensor(dones, device=device)
       rewards_tensor = torch.tensor(rewards, device=device)
       targets = behavior_model(torch.tensor(states).squeeze().to(device=device))
-      targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach()
+      with torch.no_grad():
+        targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach()
       # labels = np.array(rewards) + (np.array(dones)>0) * discount * np.max(targets_next, axis=1)
       labels = rewards_tensor + dones_tensor * discount * targets_next.max(dim=1)[0]
       # losses = loss(targets.gather(1, torch.tensor(actions).unsqueeze(1).to(device=device)).squeeze(), torch.from_numpy(labels.astype(np.float32)).to(device=device))
