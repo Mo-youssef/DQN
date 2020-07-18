@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter(log_dir="tensorboard/run2/")  # tensorboard writer
+writer = SummaryWriter(log_dir="tensorboard/run1/")  # tensorboard writer
 
 logging.basicConfig(level=logging.DEBUG, filename='logs/logs.log', filemode='w', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 
@@ -73,7 +73,7 @@ loss = nn.MSELoss()
 BS = 32
 epsilon = 1
 epsilon_min = 0.02
-epsilon_decay = (epsilon-epsilon_min)/1e6
+epsilon_decay = (epsilon-epsilon_min)/1e5
 warmup = 10000
 discount = 0.95
 skip_steps = 4
@@ -89,15 +89,17 @@ for episode in range(episodes):
   obs, reward, done = skip_action(action)
   tot_reward += reward
 
-  for step in range(steps):
-    if done:
-      break
+  # for step in range(steps):
+  #   if done:
+  #     break
+  while not done:
 
     step_counter += 1
     if step_counter % model_copy == 0:
       target_model.load_state_dict(behavior_model.state_dict())
 
     epsilon -= epsilon_decay
+    epsilon = max(epsilon, epsilon_min)
     action = env.action_space.sample() if np.random.rand() < epsilon else np.argmax(
         behavior_model(torch.from_numpy(obs).to(device=device)).detach().cpu().numpy()[0])
 
@@ -127,9 +129,7 @@ for episode in range(episodes):
       targets = behavior_model(torch.tensor(states).squeeze().to(device=device))
       with torch.no_grad():
         targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach()
-      # labels = np.array(rewards) + (np.array(dones)>0) * discount * np.max(targets_next, axis=1)
       labels = rewards_tensor + dones_tensor * discount * targets_next.max(dim=1)[0]
-      # losses = loss(targets.gather(1, torch.tensor(actions).unsqueeze(1).to(device=device)).squeeze(), torch.from_numpy(labels.astype(np.float32)).to(device=device))
       losses = loss(targets.gather(1, torch.tensor(actions, device=device).unsqueeze(1)).squeeze(), labels)
 
       optimizer.zero_grad()
@@ -140,7 +140,7 @@ for episode in range(episodes):
     logging.info(f'finished episode {episode} at timestep {step_counter} with reward {tot_reward}')
     with open('cache/rewards.pkl', 'wb') as f:
       pickle.dump(rewards, f)
-  if episode % 500 == 0:
+  if episode % 200 == 0:
     torch.save(behavior_model, f'models/model_{episode}.pt')
   rewards.append(tot_reward)
   writer.add_scalar("Reward/Episode", tot_reward, episode)
