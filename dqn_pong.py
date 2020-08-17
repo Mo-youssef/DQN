@@ -3,13 +3,15 @@ import numpy as np
 import sys
 import pickle
 import logging
-from skimage.transform import resize
-from skimage.color import rgb2gray
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(log_dir="tensorboard/run1/")  # tensorboard writer
+
+from util import *
+from DQN_model import *
 
 logging.basicConfig(level=logging.DEBUG, filename='logs/logs.log', filemode='w', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 
@@ -23,35 +25,7 @@ print("Observation space:", env.observation_space)
 print("Action space:", env.action_space)
 logging.info(f'Observation space: {env.observation_space}')
 
-def preprocess(img):
-  re_img = resize(img, (84, 84))
-  out = np.array(rgb2gray(re_img)).astype(np.float32)
-  return out
 
-class Net(nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.conv1 = nn.Conv2d(4, 16, kernel_size=8, padding=3, stride=4)  # output = 28 x 28
-    self.conv2 = nn.Conv2d(16, 32, kernel_size=4, padding=0, stride=2) # output = 13 x 13
-    self.fc1 = nn.Linear(2592, 256)
-    self.fc2 = nn.Linear(256, 6)
-  def forward(self, x):
-    out = F.relu(self.conv1(x))
-    out = F.relu(self.conv2(out))
-    out = out.view(-1, 2592)
-    out = F.relu(self.fc1(out))
-    out = self.fc2(out)
-    return out
-
-def skip_action(action):
-    reward = 0
-    obs = []
-    for _ in range(skip_steps):
-      state, rew, done, _ = env.step(action)
-      reward += rew
-      obs.append(preprocess(state))
-    obs = np.array(obs)[None, ...]
-    return obs, reward, done
 
 device = (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 print(f"Training on device {device}.")
@@ -62,14 +36,6 @@ episodes = int(1e4)
 mem_size = int(1e5)
 memory = np.empty(mem_size, dtype=object)
 step_counter = -1
-behavior_model = Net().to(device=device)
-target_model = Net().to(device=device)
-for param in target_model.parameters():
-    param.requires_grad = False
-model_copy = 500  # K
-optimizer = torch.optim.Adam(behavior_model.parameters(), lr=1e-4)  # when using RMSprop use (alpha=0.9, eps=1e-02)
-loss = nn.MSELoss()
-
 BS = 32
 epsilon = 1
 epsilon_min = 0.02
@@ -78,7 +44,15 @@ warmup = 10000
 discount = 0.95
 skip_steps = 4
 
-env = gym.make("PongNoFrameskip-v4")
+behavior_model = Net().to(device=device)
+target_model = Net().to(device=device)
+for param in target_model.parameters():
+    param.requires_grad = False
+model_copy = 1000  # K
+# when using RMSprop use (alpha=0.9, eps=1e-02)
+optimizer = torch.optim.Adam(behavior_model.parameters(), lr=1e-4)
+# loss = nn.MSELoss()
+loss = nn.SmoothL1Loss()
 
 rewards = []
 for episode in range(episodes):
@@ -86,12 +60,10 @@ for episode in range(episodes):
   action = env.action_space.sample()
 
   tot_reward = 0
-  obs, reward, done = skip_action(action)
+  obs, reward, done = skip_action(action, env, skip_steps)
+  obs = torch.as_tensor(obs, device=device)
   tot_reward += reward
 
-  # for step in range(steps):
-  #   if done:
-  #     break
   while not done:
 
     step_counter += 1
@@ -100,11 +72,13 @@ for episode in range(episodes):
 
     epsilon -= epsilon_decay
     epsilon = max(epsilon, epsilon_min)
-    action = env.action_space.sample() if np.random.rand() < epsilon else np.argmax(
-        behavior_model(torch.from_numpy(obs).to(device=device)).detach().cpu().numpy()[0])
+    action = env.action_space.sample() if np.random.rand() < epsilon else behavior_model(
+        obs).argmax().item()
 
-    obs_new, reward, done = skip_action(action)
+    obs_new, reward, done = skip_action(action, env, skip_steps)
     tot_reward += reward
+
+    obs_new = torch.as_tensor(obs_new, device=device)
 
     memory[step_counter % mem_size] = (obs, action, reward, obs_new, done)
     obs = obs_new
@@ -126,9 +100,10 @@ for episode in range(episodes):
         dones.append(done_s < 0.1)
       dones_tensor = torch.tensor(dones, device=device)
       rewards_tensor = torch.tensor(rewards, device=device)
-      targets = behavior_model(torch.tensor(states).squeeze().to(device=device))
+      targets = behavior_model(torch.stack(states).squeeze())
       with torch.no_grad():
-        targets_next = target_model(torch.tensor(states_next).squeeze().to(device=device)).detach()
+        targets_next = target_model(
+            torch.stack(states_next).squeeze()).detach()
       labels = rewards_tensor + dones_tensor * discount * targets_next.max(dim=1)[0]
       losses = loss(targets.gather(1, torch.tensor(actions, device=device).unsqueeze(1)).squeeze(), labels)
 
