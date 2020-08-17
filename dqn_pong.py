@@ -99,16 +99,18 @@ for episode in range(episodes):
         actions.append(action_s)
         rewards.append(reward_s)
         dones.append(done_s < 0.1)
+      states = torch.stack(states).squeeze()
+      states_next = torch.stack(states_next).squeeze()
       dones_tensor = torch.tensor(dones, device=device)
       rewards_tensor = torch.tensor(rewards, device=device)
-      targets = behavior_model(torch.stack(states).squeeze())
+      targets = behavior_model(states)
       with torch.no_grad():
         if double_dqn:
-          targets_next = target_model(torch.stack(states_next).squeeze()).detach()
-          double_targets = behavior_model(torch.stack(states_next).squeeze()).detach()
+          targets_next = target_model(states_next).detach()
+          double_targets = behavior_model(states_next).detach()
           q_value = targets_next.gather(1, double_targets.argmax(1).unsqueeze(1)).squeeze()
         else:
-          targets_next = target_model(torch.stack(states_next).squeeze()).detach()
+          targets_next = target_model(states_next).detach()
           q_value = targets_next.max(dim=1)[0]
       labels = rewards_tensor + dones_tensor * discount * q_value
       losses = loss(targets.gather(1, torch.tensor(actions, device=device).unsqueeze(1)).squeeze(), labels)

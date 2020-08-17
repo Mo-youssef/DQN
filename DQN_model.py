@@ -3,19 +3,32 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 class Net(nn.Module):
-  def __init__(self):
+  def __init__(self, actions=6, dueling=0):
     super().__init__()
-    self.conv1 = nn.Conv2d(4, 16, kernel_size=8, padding=3,
-                           stride=4)  # output = 28 x 28
-    self.conv2 = nn.Conv2d(16, 32, kernel_size=4,
-                           padding=0, stride=2)  # output = 13 x 13
-    self.fc1 = nn.Linear(2592, 256)
-    self.fc2 = nn.Linear(256, 6)
+    self.dueling = dueling
+    self.conv1 = nn.Conv2d(4, 32, kernel_size=8, padding=0, stride=4)
+    self.conv2 = nn.Conv2d(32, 64, kernel_size=4, padding=0, stride=2)
+    self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=0, stride=1)
+    self.fc1 = nn.Linear(64*7*7, 512)
+
+    self.value_stream = nn.Linear(64*7*7, 512)
+    self.value_out = nn.Linear(512, 1)
+    self.adv_stream = nn.Linear(64*7*7, 512)
+
+    self.output_layer = nn.Linear(512, actions)
 
   def forward(self, x):
     out = F.relu(self.conv1(x))
     out = F.relu(self.conv2(out))
-    out = out.view(-1, 2592)
-    out = F.relu(self.fc1(out))
-    out = self.fc2(out)
+    out = F.relu(self.conv3(out))
+    feature_map = out.view(x.size(0), -1)
+    if self.dueling:
+        value_input = F.relu(self.value_stream(feature_map))
+        value = self.value_out(value_input)
+        adv_input = F.relu(self.adv_stream(feature_map))
+        adv = self.output_layer(adv_input)
+        out = value + adv - adv.mean(1).unsqueeze(1)
+    else:
+        out = F.relu(self.fc1(feature_map))
+        out = self.output_layer(out)
     return out
