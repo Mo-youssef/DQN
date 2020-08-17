@@ -44,6 +44,7 @@ warmup = 10000
 discount = 0.95
 skip_steps = 4
 
+double_dqn = 1
 behavior_model = Net().to(device=device)
 target_model = Net().to(device=device)
 for param in target_model.parameters():
@@ -102,9 +103,14 @@ for episode in range(episodes):
       rewards_tensor = torch.tensor(rewards, device=device)
       targets = behavior_model(torch.stack(states).squeeze())
       with torch.no_grad():
-        targets_next = target_model(
-            torch.stack(states_next).squeeze()).detach()
-      labels = rewards_tensor + dones_tensor * discount * targets_next.max(dim=1)[0]
+        if double_dqn:
+          targets_next = target_model(torch.stack(states_next).squeeze()).detach()
+          double_targets = behavior_model(torch.stack(states_next).squeeze()).detach()
+          q_value = targets_next.gather(1, double_targets.argmax(1).unsqueeze(1)).squeeze()
+        else:
+          targets_next = target_model(torch.stack(states_next).squeeze()).detach()
+          q_value = targets_next.max(dim=1)[0]
+      labels = rewards_tensor + dones_tensor * discount * q_value
       losses = loss(targets.gather(1, torch.tensor(actions, device=device).unsqueeze(1)).squeeze(), labels)
 
       optimizer.zero_grad()
