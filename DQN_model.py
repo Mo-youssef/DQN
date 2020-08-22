@@ -23,6 +23,7 @@ class Net(nn.Module):
     out = F.relu(self.conv3(out))
     feature_map = out.view(x.size(0), -1)
     if self.dueling:
+        feature_map.register_hook(lambda x: x / np.sqrt(2))
         value_input = F.relu(self.value_stream(feature_map))
         value = self.value_out(value_input)
         adv_input = F.relu(self.adv_stream(feature_map))
