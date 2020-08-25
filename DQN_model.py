@@ -1,11 +1,14 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import numpy as np
+
 
 class Net(nn.Module):
-  def __init__(self, actions=6, dueling=0):
+  def __init__(self, actions=6, dueling=0, mode='train'):
     super().__init__()
     self.dueling = dueling
+    self.mode = mode
     self.conv1 = nn.Conv2d(4, 32, kernel_size=8, padding=0, stride=4)
     self.conv2 = nn.Conv2d(32, 64, kernel_size=4, padding=0, stride=2)
     self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=0, stride=1)
@@ -23,7 +26,8 @@ class Net(nn.Module):
     out = F.relu(self.conv3(out))
     feature_map = out.view(x.size(0), -1)
     if self.dueling:
-        feature_map.register_hook(lambda x: x / np.sqrt(2))
+        if self.mode == 'train' and feature_map.requires_grad:
+          feature_map.register_hook(lambda x: x / np.sqrt(2))
         value_input = F.relu(self.value_stream(feature_map))
         value = self.value_out(value_input)
         adv_input = F.relu(self.adv_stream(feature_map))

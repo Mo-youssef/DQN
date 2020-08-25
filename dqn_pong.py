@@ -3,15 +3,20 @@ import numpy as np
 import sys
 import pickle
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter(log_dir="tensorboard/run1/")  # tensorboard writer
 
-from util import *
-from DQN_model import *
+tensorboard_dir = 'PER_DOUBLE'
+if not os.path.exists(tensorboard_dir):
+    os.makedirs(f"tensorboard/{tensorboard_dir}")
+writer = SummaryWriter(log_dir=f"tensorboard/{tensorboard_dir}/") 
+
+from util import preprocess, skip_action
+from DQN_model import Net
 from replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 
 # logging.basicConfig(level=logging.DEBUG, filename='logs/logs.log', filemode='w', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
@@ -46,15 +51,16 @@ skip_steps = 4
 use_per = 1
 use_gpu = 1
 mem_size = int(1e5)
-alpha_per = 0.6
-beta_per = 0.7
+alpha_per = 0.7
+beta_per = 0.5
+beta_per_rate = (1-beta_per)/1e7
 memory = PrioritizedReplayBuffer(mem_size, alpha_per, use_gpu=use_gpu) if use_per else ReplayBuffer(mem_size, use_gpu=use_gpu)
 
 double_dqn = 1
-dueling = 1
+dueling = 0
 grad_norm = 10
-behavior_model = Net().to(device=device)
-target_model = Net().to(device=device)
+behavior_model = Net(dueling=dueling).to(device=device)
+target_model = Net(dueling=dueling).to(device=device)
 for param in target_model.parameters():
     param.requires_grad = False
 model_copy = 1000  # K
@@ -94,6 +100,7 @@ for episode in range(episodes):
     obs = obs_new
 
     if step_counter > warmup:
+      beta_per += beta_per_rate
       if use_per:
         states, actions, rewards, states_next, dones, weights, idxes = memory.sample(
             BS, beta_per)
@@ -133,7 +140,8 @@ for episode in range(episodes):
 
       if use_per: 
         td_error = (labels - predictions).detach().cpu().numpy()
-        memory.update_priorities(idxes, np.abs(td_error))
+        memory.update_priorities(idxes, np.abs(
+            td_error+0.001*np.min(td_error[td_error!=0])))
       
 
   if episode == 0 or episode % 10 == 0:
