@@ -1,0 +1,9 @@
+DQN/logs/
+DQN/models/
+DQN/alternatives/
+DQN/logs.log
+DQN/MR_dqn/
+pfrl/trash/
+pfrl/bak/
+pfrl/hpc_version/
+pfrl/old_version/
