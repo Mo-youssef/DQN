@@ -13,7 +13,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 import pfrl
 from double_dqn import DoubleDQN
+from categorical_double_dqn import CategoricalDoubleDQN
 from pfrl import agents
+from pfrl import nn as pnn
 from pfrl import experiments
 from pfrl import explorers, explorer
 from pfrl import utils
@@ -22,9 +24,14 @@ from pfrl import replay_buffers
 from pfrl.wrappers import atari_wrappers
 import params
 from pfrl.replay_buffer import batch_experiences
+from pfrl.q_functions import DistributionalDuelingDQN
+
+import gym_minigrid
+from gym_minigrid.wrappers import *
+from gym_minigrid.window import Window
 
 tensorboard_dir_name = params.tensorboard_dir_name
-tensorboard_dir = f"tensorboard/{tensorboard_dir_name}/"
+tensorboard_dir = f'tensorboard/{tensorboard_dir_name}/'
 if not os.path.exists(tensorboard_dir):
     os.makedirs(tensorboard_dir)
 writer = SummaryWriter(log_dir=tensorboard_dir)
@@ -74,16 +81,40 @@ class RandomSelectionEpsilonGreedy(explorer.Explorer):
     def __repr__(self):
         return "RandomSelectionEpsilonGreedy(epsilon={})".format(self.epsilon)
 
+def mini_grid_wrapper(env_id, max_frames=0, clip_rewards=True):
+    env = gym.make(env_id)
+    env = RGBImgObsWrapper(env)
+    env = ImgObsWrapper(env)
+    if max_frames:
+        env = pfrl.wrappers.ContinuingTimeLimit(env, max_episode_steps=max_frames)
+    # env = atari_wrappers.MaxAndSkipEnv(env, skip=0)
+    env = atari_wrappers.wrap_deepmind(env, episode_life=False, clip_rewards=clip_rewards)
+    return env
 
-env = atari_wrappers.wrap_deepmind(atari_wrappers.make_atari(
-    params.env_name, max_frames=params.max_frames), episode_life=False, clip_rewards=True)
+if params.env_name.startswith('MiniGrid'):
+    env = mini_grid_wrapper(params.env_name, max_frames=params.max_frames, clip_rewards=True)
+else:
+    env = atari_wrappers.wrap_deepmind(atari_wrappers.make_atari(
+        params.env_name, max_frames=params.max_frames), episode_life=True, clip_rewards=True)
 
 dueling = params.dueling
 grad_norm = params.grad_norm
-q_func = Net(actions=env.action_space.n, dueling=dueling)
 
-model_copy = params.model_copy  # K
-optimizer = torch.optim.Adam(q_func.parameters(), lr=params.lr, eps=0.0001)
+if params.rainbow:
+    q_func = DistributionalDuelingDQN(env.action_space.n, params.n_atoms, params.v_min, params.v_max) 
+    pnn.to_factorized_noisy(q_func, sigma_scale=params.noisy_net_sigma)
+    explorer = explorers.Greedy()
+else:
+    q_func = Net(actions=env.action_space.n, dueling=dueling)
+    explorer = explorers.LinearDecayEpsilonGreedy(
+        params.epsilon_max, params.epsilon_min, params.epsilon_steps,
+        lambda: np.random.randint(env.action_space.n)
+    ) if params.explorer_method == 0 else RandomSelectionEpsilonGreedy(
+        params.epsilon_min, params.epsilon_max, params.epsilon_num, params.epsilon_interval,
+        lambda: np.random.randint(env.action_space.n)
+    )
+
+optimizer = torch.optim.Adam(q_func.parameters(), lr=params.lr, eps=1.5*10**-4)
 
 
 rbuf = replay_buffers.PrioritizedReplayBuffer(
@@ -92,42 +123,46 @@ rbuf = replay_buffers.PrioritizedReplayBuffer(
     beta0=params.per_beta,
     betasteps=params.per_beta_steps,
     num_steps=params.per_num_steps,
-)
-
-step_counter = -1
-BS = params.BS
-epsilon_min = params.epsilon_min
-warmup = params.warmup
-discount = params.discount
-
-explorer = explorers.LinearDecayEpsilonGreedy(
-    params.epsilon_max, epsilon_min, params.epsilon_steps,
-    lambda: np.random.randint(env.action_space.n)
-) if params.explorer_method == 0 else RandomSelectionEpsilonGreedy(
-    params.epsilon_min, params.epsilon_max, params.epsilon_num, params.epsilon_interval,
-    lambda: np.random.randint(env.action_space.n)
+    normalize_by_max="memory"
 )
 
 def phi(x):
     # Feature extractor
     return np.asarray(x, dtype=np.float32) / 255
-
-agent = DoubleDQN(
-    q_func,
-    optimizer,
-    rbuf,
-    gpu=0,
-    gamma=discount,
-    explorer=explorer,
-    replay_start_size=warmup,
-    target_update_interval=model_copy,
-    minibatch_size=BS,
-    clip_delta=True,
-    update_interval=params.update_interval,
-    batch_accumulator="mean",
-    phi=phi,
-    max_grad_norm=params.grad_norm
-)
+if params.rainbow:
+    agent = CategoricalDoubleDQN(
+        q_func,
+        optimizer,
+        rbuf,
+        gpu=0,
+        gamma=params.discount,
+        explorer=explorer,
+        minibatch_size=params.BS,
+        replay_start_size=params.warmup,
+        target_update_interval=params.model_copy,
+        clip_delta=True,
+        update_interval=params.update_interval,
+        batch_accumulator="mean",
+        phi=phi,
+        max_grad_norm=params.grad_norm
+    )
+else:
+    agent = DoubleDQN(
+        q_func,
+        optimizer,
+        rbuf,
+        gpu=0,
+        gamma=params.discount,
+        explorer=explorer,
+        replay_start_size=params.warmup,
+        target_update_interval=params.model_copy,
+        minibatch_size=params.BS,
+        clip_delta=True,
+        update_interval=params.update_interval,
+        batch_accumulator="mean",
+        phi=phi,
+        max_grad_norm=params.grad_norm
+    )
 
 class MovingVariance():
     def __init__(self, eps=1e-10):
@@ -181,13 +216,18 @@ class RND_module():
         rnd_rewards = ((rnd_targets - rnd_preds)**2).sum()**0.5
         rnd_rewards = rnd_rewards.item()
         self.moving_std.push_val(rnd_rewards)
-        return np.clip(rnd_rewards / self.moving_std.std(), -1, 1), rnd_rewards, self.moving_std.std()
+        if params.rnd_clip:
+            ret_reward = np.clip(rnd_rewards / self.moving_std.std(), -1, 1), rnd_rewards, self.moving_std.std()
+        else:
+            ret_reward = rnd_rewards / self.moving_std.std(), rnd_rewards, self.moving_std.std()
+        return ret_reward
     def train(self, exp_batch):
         batch_current_states = exp_batch["state"]
         rnd_targets = self.rnd_target_model(batch_current_states)
         rnd_preds = self.rnd_predict_model(batch_current_states)
         rnd_rewards = ((rnd_targets - rnd_preds)**2).sum(axis=1)**0.5
-        rnd_rewards = torch.clamp(rnd_rewards,-1,1)
+        if params.rnd_clip:
+            rnd_rewards = torch.clamp(rnd_rewards,-1,1)
         self.rnd_optimizer.zero_grad()
         mean_reward = rnd_rewards.mean()
         mean_reward.backward()
@@ -198,6 +238,7 @@ if params.RND_reward:
     rnd_module = RND_module(RNDNet, torch.optim.Adam, params.lr, agent, rbuf)
     agent.set_rnd_module(rnd_module)
 
+step_counter = -1
 train_steps = -1
 episode = -1
 for _ in range(params.max_steps):
@@ -243,6 +284,9 @@ for _ in range(params.max_steps):
             int_rewards.append(reward_int)
             line_plt,  = ax2.plot(int_rewards, '-ob')
             frames.append([im_plt, title, line_plt])
+    elif (episode) % params.video_every == 0:
+        im_plt = ax1.imshow(np.array(obs)[-1], animated=True)
+        frames.append([im_plt])
     tot_reward += reward
     reset = (tstep == params.max_frames)
     agent.observe(obs, reward, done, reset)
@@ -259,7 +303,7 @@ for _ in range(params.max_steps):
   writer.add_scalar("Env Steps/Episode", step_counter, episode)
   writer.add_scalar("Train Steps/Episode", agent.optim_t, episode)
   writer.add_scalar("Buffer Size/Trainstep", len(rbuf), agent.optim_t)
-  writer.add_scalar("Epsilon/trainstep", agent.explorer.epsilon, agent.optim_t)
+#   writer.add_scalar("Epsilon/trainstep", agent.explorer.epsilon, agent.optim_t)
   if params.RND_reward:
         writer.add_scalar("Episode Intrinsic Reward/Episode", tot_reward_int, episode)
         writer.add_scalar("Episode Intrinsic Reward/Trainstep", tot_reward_int, agent.optim_t)
@@ -278,6 +322,11 @@ for _ in range(params.max_steps):
             plt.xlabel('step')
             plt.ylabel('IR')
             plt.savefig(f'video/{params.env_alias}_episode_{episode}.png')
+  elif (episode) % params.video_every == 0:
+        print('Saving Video ...........')
+        ani = animation.ArtistAnimation(fig, frames, interval=50, blit=True)
+        ax1.axis('off')
+        ani.save(f'video/{params.env_alias}_episode_{episode}.gif')
 
 env.close()
 writer.flush()
