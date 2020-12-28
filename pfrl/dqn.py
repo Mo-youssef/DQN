@@ -165,6 +165,7 @@ class DQN(agent.AttributeSavingMixin, agent.BatchAgent):
         max_grad_norm=None,
     ):
         self.rnd_reward = 0
+        self.ngu_reward = 0
         self.model = q_function
 
         if gpu is not None and gpu >= 0:
@@ -230,6 +231,8 @@ class DQN(agent.AttributeSavingMixin, agent.BatchAgent):
         self.train_prev_recurrent_states = None
         self.test_recurrent_states = None
 
+        self.replay_buffer_lock = None
+
         # Error checking
         if (
             self.replay_buffer.capacity is not None
@@ -240,6 +243,10 @@ class DQN(agent.AttributeSavingMixin, agent.BatchAgent):
     def set_rnd_module(self, rnd_module):
         self.rnd_module = rnd_module
         self.rnd_reward = 1
+
+    def set_ngu_module(self, ngu_module):
+        self.ngu_module = ngu_module
+        self.ngu_reward = 1
     @property
     def cumulative_steps(self):
         # cumulative_steps counts the overall steps during the training.
@@ -313,8 +320,10 @@ class DQN(agent.AttributeSavingMixin, agent.BatchAgent):
         )
         if self.rnd_reward:
             self.rnd_module.train(exp_batch)
+        # if self.ngu_reward:
+        #     self.ngu_module.train(exp_batch)
         if has_weight:
-            exp_batch["weights"] = torch.tensor(
+            exp_batch["weights"] = torch.tensor(              # pylint: disable=not-callable
                 [elem[0]["weight"] for elem in experiences],
                 device=self.device,
                 dtype=torch.float32,
@@ -662,6 +671,7 @@ class DQN(agent.AttributeSavingMixin, agent.BatchAgent):
             )
 
         replay_buffer_lock = mp.Lock()
+        self.replay_buffer_lock = replay_buffer_lock
 
         poller_stop_event = mp.Event()
         poller = pfrl.utils.StoppableThread(

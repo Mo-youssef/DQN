@@ -3,6 +3,7 @@ import numpy as np
 import sys
 import pickle
 import os
+import psutil
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
@@ -39,73 +40,23 @@ writer = SummaryWriter(log_dir=tensorboard_dir)
 from shutil import copyfile
 copyfile("params.py", tensorboard_dir+"params.py")
 
-from DQN_model import Net, RNDNet
+from DQN_model import Net, RNDNet, Embedding_fn, Embedding_full
+from IR_modules import NGU_module, RND_module
+from utils import RandomSelectionEpsilonGreedy, wrap_env
 
+import pdb
 
-class RandomSelectionEpsilonGreedy(explorer.Explorer):
-
-    def __init__(
-        self,
-        start_epsilon,
-        end_epsilon,
-        num_epsilon,
-        epsilon_interval,
-        random_action_func
-    ):
-        assert start_epsilon >= 0 and start_epsilon <= 1
-        assert end_epsilon >= 0 and end_epsilon <= 1
-        assert num_epsilon >= 0
-        self.random_action_func = random_action_func
-        self.epsilon = start_epsilon
-        self.epsilon_interval = epsilon_interval
-        self.epsilon_range = np.linspace(start_epsilon, end_epsilon, num_epsilon)
-
-    def select_action_epsilon_greedily(self, epsilon, random_action_func, greedy_action_func):
-        if np.random.rand() < epsilon:
-            return random_action_func(), False
-        else:
-            return greedy_action_func(), True
-    
-    def compute_epsilon(self, t):
-        if t%self.epsilon_interval == 0:
-          return np.random.choice(self.epsilon_range)
-        return self.epsilon
-
-    def select_action(self, t, greedy_action_func, action_value=None):
-        self.epsilon = self.compute_epsilon(t)
-        a, _ = self.select_action_epsilon_greedily(
-            self.epsilon, self.random_action_func, greedy_action_func
-        )
-        return a
-
-    def __repr__(self):
-        return "RandomSelectionEpsilonGreedy(epsilon={})".format(self.epsilon)
-
-def mini_grid_wrapper(env_id, max_frames=0, clip_rewards=True):
-    env = gym.make(env_id)
-    env = RGBImgObsWrapper(env)
-    env = ImgObsWrapper(env)
-    if max_frames:
-        env = pfrl.wrappers.ContinuingTimeLimit(env, max_episode_steps=max_frames)
-    # env = atari_wrappers.MaxAndSkipEnv(env, skip=0)
-    env = atari_wrappers.wrap_deepmind(env, episode_life=False, clip_rewards=clip_rewards)
-    return env
-
-if params.env_name.startswith('MiniGrid'):
-    env = mini_grid_wrapper(params.env_name, max_frames=params.max_frames, clip_rewards=True)
-else:
-    env = atari_wrappers.wrap_deepmind(atari_wrappers.make_atari(
-        params.env_name, max_frames=params.max_frames), episode_life=True, clip_rewards=True)
-
-dueling = params.dueling
-grad_norm = params.grad_norm
+env = wrap_env(params.env_name, max_frames=params.max_frames, clip_rewards=True)
 
 if params.rainbow:
     q_func = DistributionalDuelingDQN(env.action_space.n, params.n_atoms, params.v_min, params.v_max) 
+else:
+    q_func = Net(actions=env.action_space.n, dueling=params.dueling)
+    
+if params.noisynet:
     pnn.to_factorized_noisy(q_func, sigma_scale=params.noisy_net_sigma)
     explorer = explorers.Greedy()
 else:
-    q_func = Net(actions=env.action_space.n, dueling=dueling)
     explorer = explorers.LinearDecayEpsilonGreedy(
         params.epsilon_max, params.epsilon_min, params.epsilon_steps,
         lambda: np.random.randint(env.action_space.n)
@@ -114,7 +65,7 @@ else:
         lambda: np.random.randint(env.action_space.n)
     )
 
-optimizer = torch.optim.Adam(q_func.parameters(), lr=params.lr, eps=1.5*10**-4)
+optimizer = torch.optim.Adam(q_func.parameters(), lr=params.lr, eps=1e-08) # eps=1.5*10**-4)
 
 
 rbuf = replay_buffers.PrioritizedReplayBuffer(
@@ -164,147 +115,102 @@ else:
         max_grad_norm=params.grad_norm
     )
 
-class MovingVariance():
-    def __init__(self, eps=1e-10):
-        self.num = 0
-        self.eps = eps
-    def push_val(self, x):
-        self.num += 1
-        if self.num == 1:
-            self.old_m = x
-            self.new_m = x
-            self.old_s = 0
-        else:
-            self.new_m = self.old_m + (x - self.old_m)/self.num
-            self.new_s = self.old_s + (x - self.old_m) * (x - self.new_m)
-            self.old_m = self.new_m
-            self.old_s = self.new_s
-    def push(self, vec):
-        try:
-            if len(vec) > 0:
-                for x in vec:
-                    self.push_val(x)
-        except TypeError:
-            self.push_val(x)
-
-    def num_samples(self):
-        return self.num
-    def mean(self):
-        return self.new_m if self.num else 0
-    def variance(self):
-        return self.new_s / (self.num - 1) if self.num > 1 else 0
-    def std(self):
-        return (np.sqrt(self.variance()) + self.eps) if self.num > 1 else 1
-
-class RND_module():
-    def __init__(self, network_model, optimizer, lr, agent, replay_buffer):
-        # this class takes the agent as argument to get parameters not for any calculations
-        self.agent = agent
-        self.replay_buffer = replay_buffer
-        self.rnd_predict_model = network_model().to(self.agent.device)
-        self.rnd_target_model = network_model().to(self.agent.device)
-        self.rnd_optimizer = optimizer(self.rnd_predict_model.parameters(), lr=lr, eps=0.0001)
-        self.moving_std = MovingVariance()
-        self.mean_loss = 0
-    def compute_reward(self, obs):
-        obs = np.array(obs)[None, ...] 
-        obs = agent.phi(obs)
-        obs = torch.as_tensor(obs, device=self.agent.device, dtype=torch.float32)
-        rnd_targets = self.rnd_target_model.eval()(obs)
-        rnd_preds = self.rnd_predict_model.eval()(obs)
-        self.rnd_predict_model.train()
-        rnd_rewards = ((rnd_targets - rnd_preds)**2).sum()**0.5
-        rnd_rewards = rnd_rewards.item()
-        self.moving_std.push_val(rnd_rewards)
-        if params.rnd_clip:
-            ret_reward = np.clip(rnd_rewards / self.moving_std.std(), -1, 1), rnd_rewards, self.moving_std.std()
-        else:
-            ret_reward = rnd_rewards / self.moving_std.std(), rnd_rewards, self.moving_std.std()
-        return ret_reward
-    def train(self, exp_batch):
-        batch_current_states = exp_batch["state"]
-        rnd_targets = self.rnd_target_model(batch_current_states)
-        rnd_preds = self.rnd_predict_model(batch_current_states)
-        rnd_rewards = ((rnd_targets - rnd_preds)**2).sum(axis=1)**0.5
-        if params.rnd_clip:
-            rnd_rewards = torch.clamp(rnd_rewards,-1,1)
-        self.rnd_optimizer.zero_grad()
-        mean_reward = rnd_rewards.mean()
-        mean_reward.backward()
-        self.rnd_optimizer.step()
-        self.mean_loss = mean_reward
 
 if params.RND_reward:
-    rnd_module = RND_module(RNDNet, torch.optim.Adam, params.lr, agent, rbuf)
+    rnd_module = RND_module(RNDNet, torch.optim.Adam, params.lr, agent)
     agent.set_rnd_module(rnd_module)
+if params.NGU_reward:
+    ngu_module = NGU_module(Embedding_fn, Embedding_full, torch.optim.Adam, params.lr, agent,
+                            env.action_space.n, params.max_frames, params.ngu_embed_size, params.ngu_k_neighbors)
 
 step_counter = -1
-train_steps = -1
+ir_train_steps = -1
 episode = -1
-for _ in range(params.max_steps):
-  episode += 1
-  obs = env.reset()
-  tot_reward = 0
-  tot_reward_ext = 0
-  tot_reward_int = 0
-  tstep = 0
-  done = 0
-  if (episode) % params.video_every == 0:
-      fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8))
-      frames = []
-      int_rewards = []
-  while not done:
-    tstep += 1
-    if (step_counter % params.update_interval == 0) and (step_counter > params.warmup):
-      train_steps += 1
-    #   writer.add_scalar("Total Reward/Trainstep", reward, agent.optim_t)
-    #   writer.add_scalar("Average Q/trainstep", agent.get_statistics()[0][1], agent.optim_t)
-    #   writer.add_scalar("Average Loss/trainstep", agent.get_statistics()[1][1], agent.optim_t)
-    #   writer.add_scalar("Epsilon/trainstep", agent.explorer.epsilon, agent.optim_t)
-    #   writer.add_scalar("Buffer Size/Trainstep", len(rbuf), agent.optim_t)
-      if params.RND_reward:
-        writer.add_scalar("RND Loss/Trainstep", rnd_module.mean_loss, agent.optim_t)
-    step_counter += 1
-    action = agent.act(obs)
+while step_counter < params.max_steps:
+    episode += 1
+    obs = env.reset()
+    tot_reward = 0
+    tot_reward_ext = 0
+    tot_reward_int = 0
+    tstep = 0
+    done = 0
+    if params.NGU_reward:
+        ngu_module.reset()
+    if (episode) % params.video_every == 0:
+        plt.close('all')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8))
+        frames = []
+        int_rewards = []
+    while not done:
 
-    obs, reward, done, _ = env.step(action)
-    if params.RND_reward:
-        reward_int, reward_int_raw, reward_int_std = rnd_module.compute_reward(obs)
-        reward_ext = reward
-        reward += params.rnd_beta*reward_int
-        tot_reward_ext += reward_ext
-        tot_reward_int += reward_int
-        # writer.add_scalar("Extrinsic Reward/Timestep", reward_ext, step_counter)
-        writer.add_scalar("Intrinsic Reward/Timestep", reward_int, step_counter)
-        # writer.add_scalar("Intrinsic Reward Raw/Timestep", reward_int_raw, step_counter)
-        # writer.add_scalar("Intrinsic Reward STD/Timestep", reward_int_std, step_counter)
-        if (episode) % params.video_every == 0:
-            title = ax1.text(0.5, 1.05, f"IR {reward_int}", size=plt.rcParams["axes.titlesize"], ha="center", transform=ax1.transAxes)
+        tstep += 1
+        step_counter += 1
+        action = agent.act(obs)
+        obs, reward, done, _ = env.step(action)
+
+        # Training IR modules
+        # if (step_counter % params.update_interval == 0) and (step_counter > params.warmup):
+        if step_counter > params.ir_warmup:
+            ir_train_steps += 1
+            if params.NGU_reward and (step_counter % params.ngu_update_interval == 0):
+                ngu_module.train()
+            if params.RND_reward and (step_counter % params.update_interval == 0):
+                # rnd_module.train()
+                writer.add_scalar("RND Loss/Trainstep", rnd_module.mean_loss, agent.optim_t)
+
+        # adding intrinsic reward to extrinsic reward
+        if params.IR_reward:
+            # pdb.set_trace()
+            if params.RND_reward:
+                rnd_reward = rnd_module.compute_reward(obs)
+                reward_int = rnd_reward
+            if params.NGU_reward:
+                ngu_reward = ngu_module.compute_reward(obs)
+                reward_int = ngu_reward
+            if params.RND_reward and params.NGU_reward:
+                reward_int = ngu_reward * min(max(1+rnd_reward, 1), params.ngu_L)
+            reward_ext = reward
+            reward += params.ir_beta*reward_int if (step_counter > params.warmup) else 0
+            tot_reward_ext += reward_ext
+            tot_reward_int += reward_int
+            
+        tot_reward += reward
+        reset = (tstep == params.max_frames)
+        agent.observe(obs, reward, done, reset)
+
+        if done or reset:
+            break
+
+########################################################################## Logging Data and Plotting calls ##########################################################################
+
+        if params.IR_reward:
+            writer.add_scalar("Intrinsic Reward/Timestep", reward_int, step_counter)
+            if (episode) % params.video_every == 0:
+                title = ax1.text(0.5, 1.05, f"IR {reward_int}", size=plt.rcParams["axes.titlesize"], ha="center", transform=ax1.transAxes)
+                im_plt = ax1.imshow(np.array(obs)[-1], animated=True)
+                int_rewards.append(reward_int)
+                line_plt,  = ax2.plot(int_rewards, '-ob')
+                frames.append([im_plt, title, line_plt])
+        elif (episode) % params.video_every == 0:
             im_plt = ax1.imshow(np.array(obs)[-1], animated=True)
-            int_rewards.append(reward_int)
-            line_plt,  = ax2.plot(int_rewards, '-ob')
-            frames.append([im_plt, title, line_plt])
-    elif (episode) % params.video_every == 0:
-        im_plt = ax1.imshow(np.array(obs)[-1], animated=True)
-        frames.append([im_plt])
-    tot_reward += reward
-    reset = (tstep == params.max_frames)
-    agent.observe(obs, reward, done, reset)
-    # writer.add_scalar("Total Reward/Timestep", reward, step_counter)
-    # writer.add_scalar("Epsilon/timestep", agent.explorer.epsilon, step_counter)
-    if done or reset:
-        break
+            frames.append([im_plt])
 
-  if episode == 0 or episode % 10 == 0:
-    print(f'finished episode {episode} at timestep {step_counter} with reward {tot_reward_ext if params.RND_reward else tot_reward}')
+        if step_counter % params.per_size == 0:
+            process = psutil.Process(os.getpid())
+            print(process.memory_info().rss)
+            with open('mem_usage.txt', 'a') as f:
+                f.write(str(process.memory_info().rss) + '\n')
 
-  writer.add_scalar("Episode Reward/Episode", tot_reward, episode)
-  writer.add_scalar("Episode Reward/Trainstep", tot_reward, agent.optim_t)
-  writer.add_scalar("Env Steps/Episode", step_counter, episode)
-  writer.add_scalar("Train Steps/Episode", agent.optim_t, episode)
-  writer.add_scalar("Buffer Size/Trainstep", len(rbuf), agent.optim_t)
-#   writer.add_scalar("Epsilon/trainstep", agent.explorer.epsilon, agent.optim_t)
-  if params.RND_reward:
+    if episode == 0 or episode % 10 == 0:
+        print(
+            f'finished episode {episode} at timestep {step_counter} with reward {tot_reward_ext if params.IR_reward else tot_reward}')
+
+    writer.add_scalar("Episode Reward/Episode", tot_reward, episode)
+    writer.add_scalar("Episode Reward/Trainstep", tot_reward, agent.optim_t)
+    writer.add_scalar("Env Steps/Episode", step_counter, episode)
+    writer.add_scalar("Train Steps/Episode", agent.optim_t, episode)
+    writer.add_scalar("Buffer Size/Trainstep", len(rbuf), agent.optim_t)
+    if params.IR_reward:
         writer.add_scalar("Episode Intrinsic Reward/Episode", tot_reward_int, episode)
         writer.add_scalar("Episode Intrinsic Reward/Trainstep", tot_reward_int, agent.optim_t)
         writer.add_scalar("Episode Extrinsic Reward/Episode", tot_reward_ext, episode)
@@ -322,11 +228,23 @@ for _ in range(params.max_steps):
             plt.xlabel('step')
             plt.ylabel('IR')
             plt.savefig(f'video/{params.env_alias}_episode_{episode}.png')
-  elif (episode) % params.video_every == 0:
-        print('Saving Video ...........')
-        ani = animation.ArtistAnimation(fig, frames, interval=50, blit=True)
-        ax1.axis('off')
-        ani.save(f'video/{params.env_alias}_episode_{episode}.gif')
+            print('Done ...........')
+    elif (episode) % params.video_every == 0:
+            print('Saving Video ...........')
+            ani = animation.ArtistAnimation(fig, frames, interval=50, blit=True)
+            ax1.axis('off')
+            ani.save(f'video/{params.env_alias}_episode_{episode}.gif')
+            print('Done ...........')
+
 
 env.close()
 writer.flush()
+
+#   writer.add_scalar("Average Q/trainstep", agent.get_statistics()[0][1], agent.optim_t)
+#   writer.add_scalar("Average Loss/trainstep", agent.get_statistics()[1][1], agent.optim_t)
+    #   writer.add_scalar("Epsilon/trainstep", agent.explorer.epsilon, agent.optim_t)
+        # writer.add_scalar("Total Reward/Timestep", reward, step_counter)
+        # writer.add_scalar("Epsilon/timestep", agent.explorer.epsilon, step_counter)
+# writer.add_scalar("Intrinsic Reward Raw/Timestep", reward_int_raw, step_counter)
+# writer.add_scalar("Intrinsic Reward STD/Timestep", reward_int_std, step_counter)
+# writer.add_scalar("Extrinsic Reward/Timestep", reward_ext, step_counter)

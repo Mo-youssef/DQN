@@ -43,8 +43,8 @@ class Net(nn.Module):
 class RNDNet(nn.Module):
   def __init__(self):
     super().__init__()
-    self.bn1 = nn.BatchNorm2d(4, affine=False)
-    self.conv1 = nn.Conv2d(4, 32, kernel_size=8, padding=0, stride=4)
+    self.bn1 = nn.BatchNorm2d(1, affine=False)
+    self.conv1 = nn.Conv2d(1, 32, kernel_size=8, padding=0, stride=4)
     self.conv2 = nn.Conv2d(32, 64, kernel_size=4, padding=0, stride=2)
     self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=0, stride=1)
     self.output_layer = nn.Linear(64*7*7, 128)
@@ -57,4 +57,36 @@ class RNDNet(nn.Module):
     out = F.relu(self.conv3(out))
     feature_map = out.view(x.size(0), -1)
     out = self.output_layer(feature_map)
+    return out
+
+class Embedding_fn(nn.Module):
+  def __init__(self, embedding_size):
+    super().__init__()
+    self.conv1 = nn.Conv2d(1, 32, kernel_size=8, padding=0, stride=4)
+    self.conv2 = nn.Conv2d(32, 64, kernel_size=4, padding=0, stride=2)
+    self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=0, stride=1)
+    self.output_layer = nn.Linear(64*7*7, embedding_size)
+    self.embedding_size = embedding_size
+
+  def forward(self, x):
+    out = F.relu(self.conv1(x))
+    out = F.relu(self.conv2(out))
+    out = F.relu(self.conv3(out))
+    feature_map = out.view(x.size(0), -1)
+    out = F.relu(self.output_layer(feature_map))
+    return out
+
+class Embedding_full(nn.Module):
+  def __init__(self, embedding_fn, n_actions):
+    super().__init__()
+    self.embedding_fn = embedding_fn
+    self.fcl1 = nn.Linear(self.embedding_fn.embedding_size*2, 128)
+    self.fcl2 = nn.Linear(128, n_actions)
+
+  def forward(self, x1, x2):
+    state1 = self.embedding_fn(x1)
+    state2 = self.embedding_fn(x2)
+    full_state = torch.cat((state1, state2), dim=1)
+    out = F.relu(self.fcl1(full_state))
+    out = F.softmax(self.fcl2(out), dim=1)
     return out
